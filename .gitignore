@@ -3,3 +3,4 @@
 logs
 .vscode
 data
+**/__pycache__
