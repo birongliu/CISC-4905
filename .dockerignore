@@ -1,0 +1,50 @@
+# Logs
+logs/
+*.log
+
+# Data files
+data/
+*.csv
+*.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+.dockerignore
+docker-compose.yaml
+dockerfile
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Airflow config (mounted via volume)
+config/
+airflow.cfg
+airflow.db
+webserver_config.py
+
+# Airflow standalone
+standalone_admin_password.txt
+airflow-webserver.pid
+
