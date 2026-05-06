@@ -1,26 +1,33 @@
+import logging
+import os
 from pathlib import Path
+import tempfile
 
-from airflow.exceptions import AirflowSkipException
+from airflow.exceptions import AirflowException
 from airflow.providers.databricks.hooks.databricks_sql import DatabricksSqlHook
 from airflow.sdk import TaskGroup, task
-
+from office365.runtime.auth.user_credential import UserCredential
+from office365.sharepoint.client_context import ClientContext
+from cryptography.fernet import Fernet
 from databricks_reporter import WorkbookReporter
+log = logging.getLogger(__name__)
 
 
 DEFAULT_DATABRICKS_CONN_ID = "databricks_conn"
 DEFAULT_DATABRICKS_FETCH_LIMIT = 500
 DATABRICKS_SOURCE_TABLE = "workspace.flights.ingest_flights"
-GROUP_DATABRICKS_OUTPUT_PATHS = {
-    "current_week_workbook": "/opt/airflow/data/flight_data_weekday.csv",
-    "next_week_workbook": "/opt/airflow/data/flight_data_weekday.csv",
-    "next2_week_workbook": "/opt/airflow/data/flight_data_weekday.csv",
-    "current_weekend_workbook": "/opt/airflow/data/flight_data_weekend.csv",
-    "next_weekend_workbook": "/opt/airflow/data/flight_data_weekend.csv",
-}
+TEMP_WORK_DIR = Path("/opt/airflow/data/tmp")
+DEFAULT_SHAREPOINT_UPLOAD_CHUNK_SIZE = 1024 * 1024
 WEEKEND_GROUP_IDS = {
     "current_weekend_workbook",
     "next_weekend_workbook",
 }
+
+
+def _build_work_dir(metadata, group_id: str) -> Path:
+    execution_date = metadata.get("execution_date", "run")
+    TEMP_WORK_DIR.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{group_id}_{execution_date}_", dir=TEMP_WORK_DIR))
 
 
 def _build_databricks_query(group_id, fetch_limit):
@@ -46,6 +53,94 @@ WHERE {day_filter}
 ORDER BY time_position DESC
 LIMIT {safe_limit}
 """.strip()
+
+
+_REQUIRED_SHAREPOINT_KEYS = ("sharepoint_site_url", "sharepoint_username", "sharepoint_password")
+
+
+def _build_sharepoint_context(metadata: dict) -> ClientContext:
+    """Build and return an authenticated SharePoint ClientContext.
+
+    Args:
+        metadata: DAG run metadata containing SharePoint credentials.
+
+    Raises:
+        AirflowException: If any required SharePoint configuration key is missing.
+    """
+    site_url = metadata.get("sharepoint_site_url") or os.getenv("SHAREPOINT_SITE_URL")
+    username = metadata.get("sharepoint_username") or os.getenv("SHAREPOINT_USERNAME")
+    password = metadata.get("sharepoint_password", "") or os.getenv("SHAREPOINT_PASSWORD", "")
+    base_url = os.getenv("SHAREPOINT_BASE_URL") 
+    SECRET_KEY = os.getenv("SECRET_KEY")
+
+    if not SECRET_KEY:
+        raise AirflowException("Missing 'SECRET_KEY' environment variable for encrypting SharePoint password.")
+    
+    if not base_url:
+       raise AirflowException("Missing 'SHAREPOINT_BASE_URL' environment variable for SharePoint connection.")
+    
+    if password is None:
+        raise AirflowException("Missing SharePoint password. Set 'sharepoint_password' in metadata or 'SHAREPOINT_PASSWORD' in environment variables.")
+    
+    resolved_values = {
+        "sharepoint_site_url": site_url,
+        "sharepoint_username": username,
+        "sharepoint_password": password,
+        "sharepoint_base_url": base_url,
+        "secret_key": SECRET_KEY
+    }
+    missing = [key for key in _REQUIRED_SHAREPOINT_KEYS if not resolved_values.get(key)]
+    if missing:
+        raise AirflowException(
+            f"Missing SharePoint configuration key(s): {', '.join(missing)}. "
+            "Expected values from metadata or environment variables: "
+            "SHAREPOINT_SITE_URL, SHAREPOINT_USERNAME, SHAREPOINT_PASSWORD."
+        )
+    print("Secret", SECRET_KEY)
+    log.info("Authenticating to SharePoint at %s as %s", base_url, username)
+    encrypted = Fernet(SECRET_KEY).decrypt(password)
+    ctx = ClientContext(base_url).with_credentials(UserCredential(username, encrypted)).execute_query()
+
+    try:
+        ctx.load(ctx.web).execute_query()
+    except Exception as e:
+        print(f"Failed to authenticate to SharePoint: {e}")
+
+    log.info("Successfully authenticated to SharePoint")
+    return ctx
+
+
+def _upload_workbook_to_sharepoint(metadata, workbook_path):
+    def authenticate_sharepoint():
+        try:
+            return _build_sharepoint_context(metadata)
+        except AirflowException as e:
+            print(f"SharePoint authentication failed: {e}")
+            raise
+
+    def upload_file(context: ClientContext, folder_url: str, file_path: str):
+        try:
+            target_folder = context.web.get_folder_by_server_relative_path(folder_url).execute_query()
+            print(target_folder.serverRelativeUrl)
+            print(f"Uploading {file_path} to SharePoint folder {folder_url}...")
+            with open(file_path, "rb") as content_file:
+                # print(f"Read file {file_path} ({os.path.getsize(file_path)} bytes)")
+                # target_folder.upload_file("hello", 'HELLO').execute_query()
+                # target_folder.upload_file(Path(file_path).name, content_file.read()).execute_query()
+                # file_content = content_file.read()
+                # name = Path(file_path).name
+                # upload_result = target_folder.upload_file(name, file_content).execute_query()
+                # return upload_result
+                return target_folder
+        except Exception as e:
+            print(f"Failed to upload {file_path} to SharePoint folder {folder_url}: {e}")
+            raise
+
+    context = authenticate_sharepoint()
+    folder_url = metadata.get("sharepoint_folder_url")
+    if not folder_url:
+        raise AirflowException("Missing 'sharepoint_folder_url' in metadata for SharePoint upload.")
+    return upload_file(context, folder_url, workbook_path)
 
 class WorkbookGroup(TaskGroup):
 
@@ -73,19 +168,34 @@ class WorkbookGroup(TaskGroup):
 
                 databricks_conn_id = metadata.get("databricks_conn_id", DEFAULT_DATABRICKS_CONN_ID)
 
-                output_path = (
-                    metadata.get("databricks_output_path")
-                    or GROUP_DATABRICKS_OUTPUT_PATHS.get(group_id)
-                    or f"/opt/airflow/data/{group_id}_databricks.csv"
-                )
+                output_path = metadata.get("databricks_output_path")
+                if not output_path:
+                    work_dir = _build_work_dir(metadata=metadata, group_id=group_id)
+                    output_path = work_dir / "databricks.csv"
+
                 query = _build_databricks_query(group_id=group_id, fetch_limit=fetch_limit)
 
-                hook = DatabricksSqlHook(
-                    databricks_conn_id=databricks_conn_id,
-                    http_path=metadata.get("databricks_http_path"),
-                    catalog=metadata.get("databricks_catalog"),
-                    schema=metadata.get("databricks_schema"),
-                )
+                databricks_http_path = metadata.get("databricks_http_path")
+                databricks_sql_endpoint_name = metadata.get("databricks_sql_endpoint_name")
+                if not databricks_http_path and not databricks_sql_endpoint_name:
+                    raise AirflowException(
+                        "Missing Databricks SQL endpoint configuration. Set either "
+                        "'databricks_http_path' or 'databricks_sql_endpoint_name' in metadata, "
+                        "or configure http_path in the Airflow connection extras."
+                    )
+
+                hook_kwargs = {
+                    "databricks_conn_id": databricks_conn_id,
+                    "catalog": metadata.get("databricks_catalog"),
+                    "schema": metadata.get("databricks_schema"),
+                }
+                if databricks_http_path:
+                    hook_kwargs["http_path"] = databricks_http_path
+                if databricks_sql_endpoint_name:
+                    hook_kwargs["sql_endpoint_name"] = databricks_sql_endpoint_name
+
+                hook = DatabricksSqlHook(**hook_kwargs)
+        
                 dataframe = hook.get_df(sql=query, df_type="pandas")
 
                 if dataframe.empty:
@@ -103,7 +213,7 @@ class WorkbookGroup(TaskGroup):
 
             @task(task_group=self)
             def generate_workbook(metadata, group_id, source_path):
-                reporter = WorkbookReporter()
+                reporter = WorkbookReporter(output_dir=str(Path(source_path).parent))
                 workbook_path = reporter.generate_workbook(
                     source_path=source_path,
                     group_id=group_id,
@@ -114,8 +224,12 @@ class WorkbookGroup(TaskGroup):
 
             @task(task_group=self)
             def upload_to_sharepoint(metadata, group_id, workbook_path):
-                print(f"Uploading workbook for {group_id} from {workbook_path} with metadata {metadata}")
-                return "uploaded"
+                uploaded_file = _upload_workbook_to_sharepoint(metadata, workbook_path)
+                print(
+                    f"Uploaded workbook for {group_id} from {workbook_path} "
+                    f"to {uploaded_file.serverRelativeUrl}"
+                )
+                return uploaded_file.serverRelativeUrl
 
             # ---------------------------
             # Failure route

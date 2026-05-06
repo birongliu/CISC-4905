@@ -4,3 +4,4 @@ logs
 .vscode
 data
 **/__pycache__
+dags/__pycache__

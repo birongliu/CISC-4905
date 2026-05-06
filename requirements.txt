@@ -2,3 +2,4 @@ apache-airflow-providers-databricks
 pandas
 openpyxl
 holidays
+Office365-REST-Python-Client

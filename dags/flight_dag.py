@@ -9,7 +9,7 @@ CALENDAR_CSV_PATH = "/opt/airflow/data/calendar_2018_2030.csv"
 ROLLUP_ENABLED = True
 
 @dag(
-    dag_id="calendar_metadata_v3_branchless",
+    dag_id="flight_dag",
     start_date=datetime(2026, 2, 7),
     schedule="@daily",
     catchup=True,
@@ -92,10 +92,30 @@ def calendar_metadata_dag():
             "next_week": current_week + 1,
             "next2_week": current_week + 2,
             "rollup": ROLLUP_ENABLED,
-            "databricks_conn_id": "databricks_default",
+            "databricks_conn_id": os.getenv("DATABRICKS_CONN_ID", "databricks_conn"),
             "run_groups": run_groups,
         }
 
+        # Allow Databricks SQL connection details to come from container env vars.
+        for env_var, metadata_key in (
+            ("DATABRICKS_HTTP_PATH", "databricks_http_path"),
+            ("DATABRICKS_SQL_ENDPOINT_NAME", "databricks_sql_endpoint_name"),
+            ("DATABRICKS_CATALOG", "databricks_catalog"),
+            ("DATABRICKS_SCHEMA", "databricks_schema"),
+            ("SHAREPOINT_SITE_URL", "sharepoint_site_url"),
+            ("SHAREPOINT_FOLDER_URL", "sharepoint_folder_url"),
+            ("SHAREPOINT_USERNAME", "sharepoint_username"),
+            ("SHAREPOINT_BASE_URL", "sharepoint_base_url"),
+            ("SHAREPOINT_PASSWORD", "sharepoint_password"),
+            ("SHAREPOINT_CLIENT_ID", "sharepoint_client_id"),
+            ("SHAREPOINT_CLIENT_SECRET", "sharepoint_client_secret"),
+            ("SHAREPOINT_UPLOAD_CHUNK_SIZE", "sharepoint_upload_chunk_size"),
+        ):
+            value = os.getenv(env_var)
+            print(f"Environment variable {env_var} = {value}")
+            if value:
+                metadata[metadata_key] = value
+        print(f"Generated metadata for execution date {execution_date}: {metadata}")
         return metadata
 
     calendar_path = generate_calendar()
@@ -103,10 +123,6 @@ def calendar_metadata_dag():
 
     current_week_workbook = WorkbookGroup(group_id="current_week_workbook", metadata=metadata)
     next_week_workbook = WorkbookGroup(group_id="next_week_workbook", metadata=metadata)
-    # next2_week_workbook = WorkbookGroup(group_id="next2_week_workbook", metadata=metadata)
-    # current_weekend_workbook = WorkbookGroup(group_id="current_weekend_workbook", metadata=metadata)
-    # next_weekend_workbook = WorkbookGroup(group_id="next_weekend_workbook", metadata=metadata)
-
     calendar_path.set_downstream(metadata)
     metadata.set_downstream(current_week_workbook)
     metadata.set_downstream(next_week_workbook)
